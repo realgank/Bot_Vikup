@@ -4,13 +4,14 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
 
 from .adb import ADBClient
 from .buyback import BuybackManager
 from .config import Config
 from .database import Database
-from .notifications import ContractNotification
+from .notifications import ContractNotification, OcrResult
 from .ocr import OcrEngine
 from .parsing import CompositionParser, extract_nick, extract_system
 
@@ -34,6 +35,7 @@ class ContractProcessor:
         self.config = config
         self.notification_callback = notification_callback
         self._stop_event = threading.Event()
+        self.artifacts_root = Path("artifacts")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -50,6 +52,7 @@ class ContractProcessor:
                 time.sleep(poll_interval)
 
     def _process_cycle(self, poll_interval: float, cooldown: float) -> None:
+        self._apply_pending_training()
         self.adb.execute_steps(self.config.ui.get("open_contracts_steps", []))
         screenshot = self.adb.screencap()
         if screenshot is None:
@@ -70,16 +73,26 @@ class ContractProcessor:
 
         logging.info("Contract marker detected – processing first contract")
         self.adb.execute_steps(self.config.ui.get("first_contract_tap", []))
+        time.sleep(0.5)
+        contract_screenshot = self.adb.screencap()
+        if contract_screenshot is None:
+            logging.error("Failed to capture contract screenshot")
+            return
+        screenshot = contract_screenshot
 
+        ocr_texts: Dict[str, str] = {}
         system_text = self.ocr.extract_text(
             screenshot, "system", self.config.ocr_boxes
         )
+        ocr_texts["system"] = system_text
         player_text = self.ocr.extract_text(
             screenshot, "player_name", self.config.ocr_boxes
         )
+        ocr_texts["player_name"] = player_text
         game_time_text = self.ocr.extract_text(
             screenshot, "game_time", self.config.ocr_boxes
         )
+        ocr_texts["game_time"] = game_time_text
         logging.info(
             "OCR extracted system='%s', player='%s', time='%s'",
             system_text,
@@ -110,14 +123,16 @@ class ContractProcessor:
             )
 
         if not items:
-            screenshot = self.adb.screencap()
-            if screenshot:
+            composition_screenshot = self.adb.screencap()
+            if composition_screenshot:
                 ocr_text = self.ocr.extract_table(
-                    screenshot,
+                    composition_screenshot,
                     "composition_table",
                     self.config.ocr_boxes,
                     psm=6,
                 )
+                if ocr_text:
+                    ocr_texts["composition_table"] = ocr_text
                 items = self.parser.parse_from_ocr(ocr_text)
 
         if not items:
@@ -139,6 +154,15 @@ class ContractProcessor:
             user_id=user_id,
         )
 
+        screenshot_path: Optional[str] = None
+        ocr_results: Sequence[OcrResult] = ()
+        try:
+            screenshot_path, ocr_results = self._persist_ocr_artifacts(
+                contract_id, contract_screenshot, ocr_texts
+            )
+        except Exception:
+            logging.exception("Failed to persist OCR artifacts for contract %s", contract_id)
+
         self.adb.execute_steps(self.config.ui.get("close_contract_card", []))
         self.adb.execute_steps(self.config.ui.get("accept_contract", []))
         self.adb.execute_steps(self.config.ui.get("close_contracts_window", []))
@@ -157,10 +181,83 @@ class ContractProcessor:
                         est_total=est_total,
                         bisk_credited=bisk_credited,
                         discord_user_id=self._resolve_discord_id(user_id),
+                        ocr_results=ocr_results,
+                        screenshot_path=screenshot_path,
                     )
                 )
             except Exception:
                 logging.exception("Notification callback failed")
+
+    def _persist_ocr_artifacts(
+        self,
+        contract_id: int,
+        screenshot: "Image.Image",
+        ocr_texts: Dict[str, str],
+    ) -> tuple[Optional[str], Sequence[OcrResult]]:
+        artifacts_dir = self.artifacts_root / "contracts" / f"{contract_id:06d}"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        screenshot_path: Optional[Path] = None
+        try:
+            screenshot_path = artifacts_dir / "contract.png"
+            screenshot.save(screenshot_path)
+        except Exception:
+            logging.exception("Failed to save contract screenshot for #%s", contract_id)
+            screenshot_path = None
+
+        ocr_results: List[OcrResult] = []
+        for box_name, text in ocr_texts.items():
+            box = self.config.ocr_boxes.get(box_name)
+            if not box or len(box) < 4:
+                logging.warning(
+                    "Skipping OCR artifact for '%s' due to missing/invalid box", box_name
+                )
+                continue
+            crop_path: Optional[Path] = None
+            cropped = self.ocr.crop_box(screenshot, box_name, self.config.ocr_boxes)
+            if cropped is not None:
+                crop_path = artifacts_dir / f"{box_name}.png"
+                try:
+                    cropped.save(crop_path)
+                except Exception:
+                    logging.exception(
+                        "Failed to save OCR crop '%s' for contract %s",
+                        box_name,
+                        contract_id,
+                    )
+                    crop_path = None
+            self.db.store_ocr_sample(
+                contract_id=contract_id,
+                box_name=box_name,
+                box=box,
+                recognized_text=text,
+                image_path=str(crop_path) if crop_path else None,
+            )
+            ocr_results.append(
+                OcrResult(
+                    box_name=box_name,
+                    coordinates=(
+                        int(box[0]),
+                        int(box[1]),
+                        int(box[2]),
+                        int(box[3]),
+                    ),
+                    recognized_text=text,
+                    image_path=str(crop_path) if crop_path else None,
+                )
+            )
+        return (
+            str(screenshot_path) if screenshot_path else None,
+            tuple(ocr_results),
+        )
+
+    def _apply_pending_training(self) -> None:
+        words = self.db.consume_training_words()
+        if not words:
+            return
+        try:
+            self.ocr.add_training_words(words)
+        except Exception:
+            logging.exception("Failed to append training words to OCR engine")
 
     def _resolve_discord_id(self, user_id: Optional[int]) -> Optional[int]:
         if user_id is None:
