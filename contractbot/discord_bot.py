@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from pathlib import Path
+from typing import Iterable, List, Optional
 
 try:  # pragma: no cover - optional dependency guards
     import discord
@@ -49,6 +52,7 @@ else:
             self.public_replies = discord_config.public_command_replies
             self.contracts_channel_id = discord_config.contracts_channel_id
             self.guild_id = discord_config.guild_id
+            self.admin_channel_id = self._load_admin_channel_id()
             self._register_commands()
 
         async def setup_hook(self) -> None:
@@ -117,6 +121,106 @@ else:
                     ephemeral=not self.public_replies,
                 )
 
+            @self.tree.command(description="Назначить канал подтверждения контрактов")
+            @app_commands.describe(channel="Канал для проверки OCR администраторами")
+            async def set_admin_channel(
+                interaction: discord.Interaction, channel: discord.TextChannel
+            ) -> None:
+                await self._ensure_response(interaction)
+                if not await self._is_admin(interaction):
+                    await interaction.followup.send(
+                        "У вас нет прав для изменения канала администратора.",
+                        ephemeral=True,
+                    )
+                    return
+                self.admin_channel_id = channel.id
+                self.db.set_setting("discord_admin_channel_id", str(channel.id))
+                await interaction.followup.send(
+                    f"Канал администратора установлен: {channel.mention}",
+                    ephemeral=not self.public_replies,
+                )
+
+            @self.tree.command(description="Подтвердить OCR данные контракта")
+            @app_commands.describe(contract_id="Идентификатор контракта")
+            async def ocr_confirm(
+                interaction: discord.Interaction, contract_id: int
+            ) -> None:
+                await self._ensure_response(interaction)
+                if not await self._is_admin(interaction):
+                    await interaction.followup.send(
+                        "Только администратор может подтверждать OCR.",
+                        ephemeral=True,
+                    )
+                    return
+                samples = self.db.confirm_ocr_contract(
+                    contract_id,
+                    reviewer_id=interaction.user.id,
+                    reviewer_name=str(interaction.user),
+                )
+                if not samples:
+                    await interaction.followup.send(
+                        "Для указанного контракта нет OCR данных.",
+                        ephemeral=True,
+                    )
+                    return
+                words = self._extract_training_words(
+                    final_text for _, final_text in samples
+                )
+                self.db.queue_training_words(words)
+                await interaction.followup.send(
+                    f"OCR данные для контракта #{contract_id} подтверждены.",
+                    ephemeral=not self.public_replies,
+                )
+
+            @self.tree.command(description="Исправить распознанный OCR текст")
+            @app_commands.describe(
+                contract_id="Идентификатор контракта",
+                field="Название OCR области",
+                corrected_text="Исправленный текст",
+            )
+            async def ocr_correct(
+                interaction: discord.Interaction,
+                contract_id: int,
+                field: str,
+                corrected_text: str,
+            ) -> None:
+                await self._ensure_response(interaction)
+                if not await self._is_admin(interaction):
+                    await interaction.followup.send(
+                        "Только администратор может исправлять OCR.",
+                        ephemeral=True,
+                    )
+                    return
+                sample = self.db.get_ocr_sample(contract_id, field)
+                if sample is None:
+                    await interaction.followup.send(
+                        "Не удалось найти указанную область OCR для этого контракта.",
+                        ephemeral=True,
+                    )
+                    return
+                final_text = self.db.correct_ocr_sample(
+                    contract_id,
+                    field,
+                    corrected_text,
+                    reviewer_id=interaction.user.id,
+                    reviewer_name=str(interaction.user),
+                )
+                if final_text is None:
+                    await interaction.followup.send(
+                        "Не удалось сохранить исправление OCR.",
+                        ephemeral=True,
+                    )
+                    return
+                words = self._extract_training_words([final_text])
+                self.db.queue_training_words(words)
+                await interaction.followup.send(
+                    (
+                        "Исправление сохранено."
+                        f" Было: `{sample['recognized_text']}`; стало: `{final_text}`."
+                    ),
+                    ephemeral=not self.public_replies,
+                )
+
         async def _ensure_response(self, interaction: discord.Interaction) -> None:
             if interaction.response.is_done():
                 return
@@ -166,3 +270,94 @@ else:
                 f" зачтено в BISK: {notification.bisk_credited:.2f}.{mention}"
             )
             await channel.send(message)
+            await self._send_admin_notification(notification)
+
+        async def _send_admin_notification(
+            self, notification: ContractNotification
+        ) -> None:
+            if self.admin_channel_id is None:
+                return
+            channel = await self._resolve_text_channel(self.admin_channel_id)
+            if channel is None:
+                logging.warning(
+                    "Discord admin channel %s not found", self.admin_channel_id
+                )
+                return
+
+            lines = [
+                f"Контракт #{notification.contract_id} для {notification.player_name} (система {notification.system}).",
+                "Проверьте результаты OCR и подтвердите через /ocr_confirm или исправьте через /ocr_correct.",
+                "Распознанные области:",
+            ]
+            for result in notification.ocr_results:
+                coords = ", ".join(str(value) for value in result.coordinates)
+                text = result.recognized_text or "<пусто>"
+                lines.append(
+                    f"• {result.box_name}: `{text}` (box: [{coords}])"
+                )
+            if not notification.ocr_results:
+                lines.append("• Нет сохранённых OCR результатов")
+
+            files: List[discord.File] = []
+            handles: List = []
+            try:
+                if notification.screenshot_path:
+                    screenshot_path = Path(notification.screenshot_path)
+                    if screenshot_path.exists():
+                        handle = screenshot_path.open("rb")
+                        handles.append(handle)
+                        files.append(
+                            discord.File(
+                                handle, filename=screenshot_path.name, spoiler=False
+                            )
+                        )
+                for result in notification.ocr_results:
+                    if not result.image_path:
+                        continue
+                    crop_path = Path(result.image_path)
+                    if not crop_path.exists():
+                        continue
+                    handle = crop_path.open("rb")
+                    handles.append(handle)
+                    files.append(
+                        discord.File(handle, filename=f"{notification.contract_id}_{crop_path.name}")
+                    )
+                await channel.send("\n".join(lines), files=files)
+            finally:
+                for handle in handles:
+                    handle.close()
+
+        async def _resolve_text_channel(
+            self, channel_id: Optional[int]
+        ) -> Optional[discord.TextChannel]:
+            if channel_id is None:
+                return None
+            channel = self.get_channel(channel_id)
+            if channel is not None and isinstance(channel, discord.TextChannel):
+                return channel
+            try:
+                fetched = await self.fetch_channel(channel_id)
+            except Exception:
+                logging.exception("Failed to fetch channel %s", channel_id)
+                return None
+            if isinstance(fetched, discord.TextChannel):
+                return fetched
+            return None
+
+        def _load_admin_channel_id(self) -> Optional[int]:
+            stored = self.db.get_setting("discord_admin_channel_id")
+            if not stored:
+                return None
+            try:
+                return int(stored)
+            except (TypeError, ValueError):
+                logging.warning("Invalid admin channel id stored in settings: %s", stored)
+                return None
+
+        def _extract_training_words(
+            self, texts: Iterable[str]
+        ) -> List[str]:
+            words: List[str] = []
+            for text in texts:
+                words.extend(re.findall(r"[\w\-']+", text, re.UNICODE))
+            return words
