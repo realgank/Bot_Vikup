@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contractbot"
+version = "0.1.0"
+description = "Cross-platform automation service for processing game contracts via ADB and OCR"
+readme = "README.md"
+authors = [{name = "ContractBot Maintainers"}]
+license = {text = "Proprietary"}
+requires-python = ">=3.9"
+dependencies = [
+  "pillow",
+  "pytesseract",
+  "discord.py",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+contractbot = "contractbot.app:main"
