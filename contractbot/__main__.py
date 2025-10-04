@@ -1,7 +1,6 @@
-"""Compatibility wrapper for the ContractBot package."""
 from __future__ import annotations
 
-from contractbot.app import main
+from .app import main
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
